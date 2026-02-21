@@ -107,15 +107,12 @@ def noise_suppress_freq_domain(subbands, noise_threshold=0.05, adaptive=True):
             median = torch.median(subband_abs)
             mean = torch.mean(subband_abs)
             std = torch.std(subband_abs)
-            
-            # 更平滑的阈值策略
+
             threshold_soft = median + noise_threshold * std
             threshold_hard = mean + std
-            
-            # Sigmoid软阈值
+      
             subband_processed = subband * torch.sigmoid((subband_abs - threshold_soft) / std)
-            
-            # 轻微硬阈值处理
+
             mask_extreme = subband_abs > threshold_hard
             subband_processed[mask_extreme] *= 0.1
             
