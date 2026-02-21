@@ -12,115 +12,111 @@ def get_conv(ratio=5, stride=1):
     return conv
 
 def smooth(noisy, ratio=13, stride=1):
-    conv = get_conv(ratio, stride)
+
     b, c, h, w = noisy.shape
-    smoothed = conv(noisy.view(-1, 1, h, w))
-    _, _, new_h, new_w = smoothed.shape     
-    return smoothed.view(1, c, new_h, new_w).detach()
+    conv = get_conv(ratio, stride)
+    smoothed = conv(noisy.view(b * c, 1, h, w))  
+    _, _, new_h, new_w = smoothed.shape
+    smoothed = smoothed.view(b, c, new_h, new_w)        
+    
+    return smoothed.detach()
 
 def reproduce(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
 
-def calculate_sliding_std(img, upsampler, kernel_size, stride):   
-    slided_mean = smooth(img, kernel_size, stride=stride)
+def calculate_sliding_std(img, kernel_size=2):
+    # 
+    upsampler = nn.Upsample(size=(img.shape[-2], img.shape[-1]), mode='bilinear', align_corners=True)
+    slided_mean = smooth(img, kernel_size, stride=1)
     mean_upsampled = upsampler(slided_mean)
-    variance = smooth( (img - mean_upsampled)**2, kernel_size, stride=stride)
+    variance = smooth((img - mean_upsampled)**2, kernel_size, stride=1)
     upsampled_variance = upsampler(variance)
     return upsampled_variance.sqrt()
 
-
-def shuffle_input(img, indices, mask, c, size, k):
-    if c == 1:
-        img_torch = torch.from_numpy(img).unsqueeze(0)
-    else:
-        img_torch = torch.from_numpy(img)
-    mask_torch = torch.from_numpy(mask).unsqueeze(0).repeat(c, 1, 1)
-    img_torch_rearranged = rearrange(img_torch.unsqueeze(1), 'c 1 (h1 h) (w1 w) -> c (h1 w1) h w ', h1=size//k, w1=size//k) # (c H//k W//k k k)
-    mask_torch_rearranged = rearrange(mask_torch.unsqueeze(1), 'c 1 (h1 h) (w1 w) -> c (h1 w1) h w ', h1=size//k, w1=size//k)
-    img_torch_rearranged = img_torch_rearranged.view(c, -1, k*k)# (c H//k*W//k k*k)
-    mask_torch_rearranged, _ = torch.max(mask_torch_rearranged.view(c, -1, k*k), 2, keepdim=True)
-    img_torch_reordered = torch.gather(img_torch_rearranged.clone(), dim=-1, index=indices).clone()
-    img_torch_reordered_v2 = img_torch_reordered.view(c, -1, k*k)
-    # Shuffle the image only at the flat regions (where mask = 0)
-    img_torch_final = mask_torch_rearranged * img_torch_rearranged + (1 - mask_torch_rearranged) * img_torch_reordered_v2
-    img_torch_final = img_torch_final.view(c, -1, k, k)    
-    img_torch_final_v2 = rearrange(img_torch_final, 'c (h1 w1) h w -> c 1 (h1 h) (w1 w) ', h1=size//k, w1=size//k)
-    return img_torch_final_v2.squeeze().cpu().numpy() 
-
 def get_shuffling_mask(std_map_torch, threshold=0.5):
-    std_map = std_map_torch.cpu().numpy().squeeze()
-    normalized = std_map/std_map.max()
-    thresholded = np.zeros_like(normalized)
-    thresholded[normalized >= threshold] = 1.
-    return thresholded
+    #  
+    std_map = std_map_torch.mean(dim=1, keepdim=True) #  
+    max_val = std_map.view(std_map.size(0), -1).max(dim=1)[0].view(-1, 1, 1, 1)
+    normalized = std_map / (max_val + 1e-8)
+    binary_mask = (normalized >= threshold).float()
+    return binary_mask
 
+def shuffle_input(img_torch, indices, binary_mask, k=4):
+    #  
+    b, c, h, w = img_torch.shape
+    #  
+    img_rearranged = rearrange(img_torch, 'b c (h1 h) (w1 w) -> b (h1 w1) c (h w)', h=k, w=k)
+    #  
+    img_reordered = torch.gather(img_rearranged, dim=-1, index=indices.expand(-1, -1, c, -1))
+    #  
+    img_reordered = rearrange(img_reordered, 'b (h1 w1) c (h w) -> b c (h1 h) (w1 w)', h1=h//k, w1=w//k, h=k, w=k)
+    
+    img_final = binary_mask * img_torch + (1 - binary_mask) * img_reordered
+    return img_final
 
-def generate_random_permutation(img_size, c, factor):
-    d1, d2, d3 = c, (img_size//factor)*(img_size//factor), factor*factor
-    permutaion_indices = torch.argsort(torch.rand(1, d2, d3), dim=-1)
-    permutaion_indices = permutaion_indices.repeat(d1, 1, 1)
-    reverse_permutation_indices = torch.argsort(permutaion_indices, dim=-1)
-
-    return permutaion_indices, reverse_permutation_indices
-
+def generate_random_permutation(b, h, w, k, device):
+   
+    num_blocks = (h // k) * (w // k)
+    num_pixels = k * k
+    indices = torch.stack([torch.randperm(num_pixels) for _ in range(b * num_blocks)]).to(device)
+    indices = indices.view(b, num_blocks, 1, num_pixels)
+    return indices
 
 def numpy_to_torch(x):
-    """Convert numpy array to torch tensor."""
-    return torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
+    if len(x.shape) == 3: # HWC
+        x = np.transpose(x, (2, 0, 1))
+    return torch.from_numpy(x).float().unsqueeze(0).cuda()
 
 def torch_to_numpy(x):
-    """Convert torch tensor to numpy array."""
-    return x.squeeze().cpu().numpy()
+    return x.detach().cpu().squeeze().numpy()
 
-def dwt_torch(x):
-    """
-    Perform 2D Discrete Wavelet Transform using PyWavelets on torch tensor
-    Returns LL, LH, HL, HH subbands
-    """
+def dwt_torch(x):  
     x_np = torch_to_numpy(x)
-    coeffs = pywt.dwt2(x_np, 'haar')
-    LL, (LH, HL, HH) = coeffs
-    
-    return (numpy_to_torch(coeff) for coeff in [LL, LH, HL, HH])
+    #
+    if len(x_np.shape) == 3:
+        ll_list, lh_list, hl_list, hh_list = [], [], [], []
+        for c in range(x_np.shape[0]):
+            coeffs = pywt.dwt2(x_np[c], 'haar')
+            ll, (lh, hl, hh) = coeffs
+            ll_list.append(ll); lh_list.append(lh); hl_list.append(hl); hh_list.append(hh)
+        return (numpy_to_torch(np.array(l)) for l in [ll_list, lh_list, hl_list, hh_list])
+    else:
+        coeffs = pywt.dwt2(x_np, 'haar')
+        ll, (lh, hl, hh) = coeffs
+        return (numpy_to_torch(coeff) for coeff in [ll, lh, hl, hh])
 
-def idwt_torch(LL, LH, HL, HH):
-    """
-    Perform 2D Inverse Discrete Wavelet Transform using PyWavelets
-    """
-    LL_np = torch_to_numpy(LL)
-    LH_np = torch_to_numpy(LH)
-    HL_np = torch_to_numpy(HL)
-    HH_np = torch_to_numpy(HH)
-    
-    reconstructed = pywt.idwt2((LL_np, (LH_np, HL_np, HH_np)), 'haar')
-    
-    return numpy_to_torch(reconstructed)
+def idwt_torch(LL, LH, HL, HH):   
+    ll_np, lh_np, hl_np, hh_np = (torch_to_numpy(x) for x in [LL, LH, HL, HH])
+    if len(ll_np.shape) == 3:
+        recon_list = []
+        for c in range(ll_np.shape[0]):
+            recon = pywt.idwt2((ll_np[c], (lh_np[c], hl_np[c], hh_np[c])), 'haar')
+            recon_list.append(recon)
+        return numpy_to_torch(np.array(recon_list))
+    else:
+        recon = pywt.idwt2((ll_np, (lh_np, hl_np, hh_np)), 'haar')
+        return numpy_to_torch(recon)
 
-def noise_suppress_freq_domain(subbands, noise_threshold=0.05, adaptive=True):
+def noise_suppress_freq_domain(subbands, noise_threshold=0.05):   
     LL, LH, HL, HH = subbands
+    processed_list = []
     
-    if adaptive:
-        for i, subband in enumerate([LH, HL, HH]):
-            subband_abs = torch.abs(subband)
-            median = torch.median(subband_abs)
-            mean = torch.mean(subband_abs)
-            std = torch.std(subband_abs)
-
-            threshold_soft = median + noise_threshold * std
-            threshold_hard = mean + std
-      
-            subband_processed = subband * torch.sigmoid((subband_abs - threshold_soft) / std)
-
-            mask_extreme = subband_abs > threshold_hard
-            subband_processed[mask_extreme] *= 0.1
-            
-            if i == 0:
-                LH = subband_processed
-            elif i == 1:
-                HL = subband_processed
-            else:
-                HH = subband_processed
-    
-    return LL, LH, HL, HH
+    for subband in [LH, HL, HH]:
+        subband_abs = torch.abs(subband)
+        std_val = torch.std(subband)
+        median_val = torch.median(subband_abs)
+        T_S = median_val + noise_threshold * std_val
+                
+        T_H = torch.mean(subband_abs) + std_val
+        
+        soft_mask = torch.sigmoid((subband_abs - T_S) / (std_val + 1e-8))
+        hard_mask = torch.ones_like(subband)
+        hard_mask[subband_abs > T_H] = 0.1
+        
+        processed_list.append(subband * soft_mask * hard_mask)
+        
+    return LL, processed_list[0], processed_list[1], processed_list[2]
