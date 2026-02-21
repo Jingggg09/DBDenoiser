@@ -11,10 +11,6 @@ from utils import reproduce, calculate_sliding_std, shuffle_input, get_shuffling
 from skimage.metrics import peak_signal_noise_ratio
 from skimage.metrics import structural_similarity as ssim
 
-# 设置环境变量
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
-
-# 创建输出目录
 if not os.path.exists('output-polyu'):
     os.makedirs('output-polyu')
 if not os.path.exists('output-polyu/subbands'):
@@ -22,22 +18,13 @@ if not os.path.exists('output-polyu/subbands'):
 if not os.path.exists('output-polyu/denoised_subbands'):
     os.makedirs('output-polyu/denoised_subbands')
 
-# 存储结果的列表
+
 results_polyu = []
 
-# 设置随机种子
-reproduce(42)
+# reproduce(42)
 
 def save_model(model, path, iteration, loss):
-    """
-    保存模型检查点
-    
-    Args:
-        model (nn.Module): 要保存的模型
-        path (str): 保存路径
-        iteration (int): 当前迭代次数
-        loss (float): 当前损失值
-    """
+  
     checkpoint = {
         'iteration': iteration,
         'model_state_dict': model.state_dict(),
@@ -46,16 +33,14 @@ def save_model(model, path, iteration, loss):
     torch.save(checkpoint, path)
 
 def save_subbands(LL, LH, HL, HH, filename_prefix, output_dir):
-    """
-    保存分解子带图像
-    """
+   
     for name, subband in zip(['LL', 'LH', 'HL', 'HH'], [LL, LH, HL, HH]):
         subband_np = torch_to_numpy(subband) * 255.
         subband_np = np.clip(subband_np, 0, 255).astype(np.uint8)
-        if subband_np.shape[0] == 3:  # RGB图像
+        if subband_np.shape[0] == 3:  # 
             subband_np = np.transpose(subband_np, (1, 2, 0))
             cv2.imwrite(f'{output_dir}/{filename_prefix}_{name}.png', cv2.cvtColor(subband_np, cv2.COLOR_RGB2BGR))
-        else:  # 单通道图像
+        else:  # 
             cv2.imwrite(f'{output_dir}/{filename_prefix}_{name}.png', subband_np)
 
 def train_model(model, noisy_original_torch, clean_original_torch, config, filename):
@@ -77,20 +62,20 @@ def train_model(model, noisy_original_torch, clean_original_torch, config, filen
     
     os.makedirs(config.get('model_save_dir', 'checkpoints'), exist_ok=True)
     
-    # 进行DWT分解并保存原始子带
+    # 
     LL, LH, HL, HH = dwt_torch(noisy_original_torch)
     save_subbands(LL, LH, HL, HH, f'noisy_{filename}', 'output-polyu/subbands')
     
-    # 频率域噪声抑制
+    # 
     LL_denoised, LH_denoised, HL_denoised, HH_denoised = noise_suppress_freq_domain(
         (LL, LH, HL, HH)
     )
     
-    # 保存去噪后的子带
+    # 
     save_subbands(LL_denoised, LH_denoised, HL_denoised, HH_denoised, 
                   f'denoised_{filename}', 'output-polyu/denoised_subbands')
     
-    # 重建图像
+    # 
     freq_denoised = idwt_torch(LL_denoised, LH_denoised, HL_denoised, HH_denoised)
     
     for iter in range(config['num_iterations']):
@@ -127,35 +112,29 @@ def train_model(model, noisy_original_torch, clean_original_torch, config, filen
     
     return model
 
-# 加载PolyU数据集
+# 
 noisy_dir = 'data/PolyU/NOISE'
 clean_dir = 'data/PolyU/GT'
 noisy_files = [f for f in os.listdir(noisy_dir) if f.endswith('.JPG')]
 
-# 加载配置
+# 
 with open('configs/sidd.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
 for noisy_file in noisy_files:
-    # 获取对应的干净图像文件名
     clean_file = noisy_file.replace('_real.JPG', '_mean.JPG')
-    
-    # 加载噪声和干净图像
+
     noisy_img = np.array(Image.open(os.path.join(noisy_dir, noisy_file)).convert('RGB')).astype(np.float32)
     clean_img = np.array(Image.open(os.path.join(clean_dir, clean_file)).convert('RGB')).astype(np.float32)
     
-    # 转换为 torch 张量并确保为float类型
     noisy_original_torch = torch.from_numpy(np.transpose(noisy_img, (2, 0, 1)) / 255.).float().unsqueeze(0).cuda()
     clean_original_torch = torch.from_numpy(np.transpose(clean_img, (2, 0, 1)) / 255.).float().unsqueeze(0).cuda()
     
-    # 初始化模型
     model = DualBranchDenoiser(in_channels=3).cuda()
     model.train()
     
-    # 训练模型
     model = train_model(model, noisy_original_torch, clean_original_torch, config, noisy_file.split('.')[0])
     
-    # 推理阶段
     model.eval()
     avg = 0.
     with torch.no_grad():
@@ -164,26 +143,22 @@ for noisy_file in noisy_files:
             to_img = output.detach().cpu().squeeze().permute(1, 2, 0).numpy()
             avg += to_img
     
-    # 后处理
     denoised_img = np.clip((avg/float(config['num_predictions']))*255., 0., 255.).astype(np.uint8)
-    
-    # 保存去噪图像
+
     output_path = f'output-polyu/denoised_{noisy_file.split(".")[0]}.png'
-    cv2.imwrite(output_path, cv2.cvtColor(denoised_img, cv2.COLOR_RGB2BGR))
-    
-    # 计算评估指标
+    cv2.imwrite(output_path, cv2.cvtColor(denoised_img, cv2.COLOR_RGB2BGR))    
+
     psnr = peak_signal_noise_ratio(clean_img, denoised_img, data_range=255)
     ssim_val = ssim(clean_img, denoised_img, channel_axis=2, data_range=255)
     print(f"Image: {noisy_file}, PSNR: {psnr:.2f}, SSIM: {ssim_val:.4f}")
     
-    # 存储结果
     results_polyu.append({
         'image': noisy_file,
         'psnr': psnr,
         'ssim': ssim_val
     })
 
-# 保存结果到 CSV
+
 results_df = pd.DataFrame(results_polyu)
 results_df.to_csv('output-polyu/results.csv', index=False)
 print(f"Average PSNR: {results_df['psnr'].mean():.2f}")
