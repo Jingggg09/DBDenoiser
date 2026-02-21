@@ -1,13 +1,63 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-class FrequencyBranch(nn.Module):
-    def __init__(self, in_channels=1):
-        super(FrequencyBranch, self).__init__()
 
-        self.channel_expand = nn.Conv2d(in_channels, 32, kernel_size=1)
+class HaarDWT(nn.Module):
+    def __init__(self, in_channels=3):
+        super(HaarDWT, self).__init__()
+        self.in_channels = in_channels
+
+        kernel = torch.tensor([
+            [[1, 1], [1, 1]],  # LL 
+            [[1, -1], [1, -1]], # LH 
+            [[1, 1], [-1, -1]], # HL 
+            [[1, -1], [-1, 1]]  # HH 
+        ], dtype=torch.float32).view(4, 1, 2, 2) / 2.0
         
-        self.freq_conv = nn.Sequential(
+        weight = kernel.repeat(in_channels, 1, 1, 1)     # [4*in_channels, 1, 2, 2]
+        self.register_buffer('weight', weight)
+
+    def forward(self, x):
+        out = F.conv2d(x, self.weight, stride=2, groups=self.in_channels)
+        B, C4, H, W = out.shape
+        out = out.view(B, self.in_channels, 4, H, W)
+        return out[:, :, 0], out[:, :, 1], out[:, :, 2], out[:, :, 3]
+
+class HaarIDWT(nn.Module):
+    def __init__(self, in_channels=3):
+        super(HaarIDWT, self).__init__()
+        self.in_channels = in_channels
+        kernel = torch.tensor([
+            [[1, 1], [1, 1]], 
+            [[1, -1], [1, -1]], 
+            [[1, 1], [-1, -1]], 
+            [[1, -1], [-1, 1]]
+        ], dtype=torch.float32).view(4, 1, 2, 2) / 2.0
+        self.register_buffer('weight', kernel.repeat(in_channels, 1, 1, 1))#.unsqueeze(1))
+
+    def forward(self, LL, LH, HL, HH):
+        B, C, H, W = LL.shape
+        x = torch.stack([LL, LH, HL, HH], dim=2).view(B, C*4, H, W)
+        
+        out = F.conv_transpose2d(
+            x, 
+            self.weight, 
+            stride=2, 
+            groups=self.in_channels,
+            output_padding=0
+        )     
+        return out
+
+class FrequencyBranch(nn.Module):
+    def __init__(self, in_channels=3):
+        super(FrequencyBranch, self).__init__()
+        self.dwt = HaarDWT(in_channels)
+        self.idwt = HaarIDWT(in_channels)
+        
+        self.alpha = nn.Parameter(torch.full((1,), 0.05))
+        
+        self.refine_cnn = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=1), 
             ResBlock(32, 3),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
@@ -15,112 +65,112 @@ class FrequencyBranch(nn.Module):
             ResBlock(64, 3),
             nn.Conv2d(64, in_channels, kernel_size=3, padding=1)
         )
-    
+
+    def adaptive_threshold_process(self, S):
+        S_abs = torch.abs(S)
+        std_S = torch.std(S, dim=(2,3), keepdim=True)
+        B, C, H, W = S_abs.shape
+        S_abs_flat = S_abs.view(B, C, H * W)          # [B, C, H*W]
+        median_abs, _ = torch.median(S_abs_flat, dim=2, keepdim=True)  # [B, C, 1]
+        median_abs = median_abs.unsqueeze(-1)          # [B, C, 1, 1] 
+
+        mean_abs = torch.mean(S_abs, dim=(2, 3), keepdim=True)  # [B, C, 1, 1]
+
+        T_S = median_abs + self.alpha * std_S
+        T_H = mean_abs + std_S
+
+        M_hard = torch.where(S_abs > T_H,
+                             torch.tensor(0.1, device=S.device, dtype=S.dtype),
+                             torch.tensor(1.0, device=S.device, dtype=S.dtype))
+
+        soft_weight = torch.sigmoid((S_abs - T_S) / (std_S + 1e-6))
+        S_prime = S * soft_weight * M_hard
+
+        return S_prime
+
     def forward(self, x):
-
-        x_expanded = self.channel_expand(x)
-
-        freq_result = self.freq_conv(x_expanded) + x
+        LL, LH, HL, HH = self.dwt(x)
         
-        return freq_result
+        LH_p = self.adaptive_threshold_process(LH)
+        HL_p = self.adaptive_threshold_process(HL)
+        HH_p = self.adaptive_threshold_process(HH)
+        
+        I_f = self.idwt(LL, LH_p, HL_p, HH_p)
+        
+        return I_f + self.refine_cnn(I_f)
 
 class MultiScaleSpatialBranch(nn.Module):
-    def __init__(self, in_channels=1, scales=3):
+    def __init__(self, in_channels=3, scales=3):
         super(MultiScaleSpatialBranch, self).__init__()
-        
         self.scales = scales
-
+        
         self.scale_modules = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(32),
-                nn.LeakyReLU(0.1),
-                nn.MaxPool2d(2, stride=2),
-                nn.Conv2d(32, 32 * (2**i), kernel_size=3, stride=1, padding=1),
+                nn.Conv2d(in_channels, 32 * (2**i), kernel_size=3, padding=1),
                 nn.BatchNorm2d(32 * (2**i)),
-                nn.LeakyReLU(0.1)
+                nn.LeakyReLU(0.1),
+                nn.MaxPool2d(2) 
             ) for i in range(scales)
         ])
-
+        
         self.mask_generators = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(32 * (2**i), 1, kernel_size=3, stride=1, padding=1),
+                nn.Conv2d(32 * (2**i), 1, kernel_size=3, padding=1),
                 nn.Sigmoid()
             ) for i in range(scales)
         ])
         
-        total_channels = sum(32 * (2**i) for i in range(scales))
-        self.feature_fusion = nn.Sequential(
-            nn.Conv2d(total_channels, in_channels, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1)
-        )  
-
         self.trunk_network = UNet_n2n_un(in_channels, in_channels)
-    
-    def forward(self, x, mask_ratio=0.5):
 
-        multi_scale_features = []
+    def forward(self, x):
         multi_scale_masks = []
-        
         current_input = x
-        for scale_module, mask_generator in zip(self.scale_modules, self.mask_generators):
-
-            feature = scale_module(current_input)
-            multi_scale_features.append(feature)
-
-            mask = mask_generator(feature)
-            multi_scale_masks.append(mask)
-            
-            current_input = F.interpolate(current_input, scale_factor=0.5, mode='bilinear', align_corners=False)
-
-        max_size = multi_scale_features[0].shape[-2:]
-        aligned_features = []
-        aligned_masks = []
-        for feature, mask in zip(multi_scale_features, multi_scale_masks):
-            aligned_feature = F.interpolate(feature, size=max_size, mode='bilinear', align_corners=False)
+        
+        for i in range(self.scales):
+            feat = self.scale_modules[i](current_input)
+            mask = self.mask_generators[i](feat)
             aligned_mask = F.interpolate(mask, size=x.shape[-2:], mode='bilinear', align_corners=False)
-            aligned_masks.append(aligned_mask)
-            aligned_features.append(aligned_feature)
-        
-        fused_feature = torch.cat(aligned_features, dim=1)
-        fused_feature = self.feature_fusion(fused_feature)
+            multi_scale_masks.append(aligned_mask)
+            current_input = F.interpolate(x, scale_factor=1/(2**(i+1)), mode='bilinear', align_corners=False)
 
-        combined_mask = torch.mean(torch.stack(aligned_masks), dim=0)
+        combined_mask = torch.mean(torch.stack(multi_scale_masks), dim=0)
         
-        if combined_mask.shape != x.shape:
-            combined_mask = F.interpolate(combined_mask, size=x.shape[-2:], mode='bilinear', align_corners=False)
-
-        masked_input = x * combined_mask
-        denoised_output = self.trunk_network(masked_input)
-        
-        return denoised_output, multi_scale_masks
+        return self.trunk_network(x * combined_mask), multi_scale_masks
 
 class DualBranchDenoiser(nn.Module):
-    def __init__(self, in_channels=1):
+    def __init__(self, in_channels=3):
         super(DualBranchDenoiser, self).__init__()
-        
         self.frequency_branch = FrequencyBranch(in_channels)
         self.spatial_branch = MultiScaleSpatialBranch(in_channels)
         
-        # Feature fusion module
-        self.fusion_conv = nn.Sequential(
+        self.fusion_module = nn.Sequential(
             nn.Conv2d(in_channels * 2, in_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels),
             nn.LeakyReLU(0.1),
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.LeakyReLU(0.1)
         )
-    
-    def forward(self, x, mask_ratio=0.5):
-        # Frequency domain processing
-        freq_result = self.frequency_branch(x)
+
+    def forward(self, x):
+        f_freq = self.frequency_branch(x)
+        f_spatial, masks = self.spatial_branch(x)
         
-        # Spatial domain processing
-        spatial_result, multi_scale_masks = self.spatial_branch(x, mask_ratio)
+        return self.fusion_module(torch.cat([f_freq, f_spatial], dim=1)), masks
+
+class ResBlock(nn.Module):
+    def __init__(self, nf, ksize):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(nf, nf, ksize, 1, ksize//2),
+            nn.BatchNorm2d(nf),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(nf, nf, ksize, 1, ksize//2),
+            nn.BatchNorm2d(nf)
+        )
+    def forward(self, x):
+        return F.leaky_relu(x + self.body(x), 0.1)
         
-        # Fusion
-        fused_result = torch.cat([freq_result, spatial_result], dim=1)
-        final_output = self.fusion_conv(fused_result)
-        
-        return final_output, multi_scale_masks
 
 class UNet_n2n_un(nn.Module):
     def __init__(self, in_channels=3, out_channels=3):
@@ -192,15 +242,13 @@ class UNet_n2n_un(nn.Module):
 
             nn.Conv2d(32, out_channels, 3, padding=1, bias=True))
 
-        # Initialize weights
-        # self._init_weights()
+        self._init_weights()  #  
 
-    # def _init_weights(self):
-    #     """Initializes weights using He et al. (2015)."""
-    #     for m in self.modules():
-    #         if isinstance(m, nn.ConvTranspose2d) or isinstance(m, nn.Conv2d):
-    #             nn.init.kaiming_normal_(m.weight.data)
-    #             m.bias.data.zero_()
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.ConvTranspose2d) or isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight.data)
+                m.bias.data.zero_()
 
     def forward(self, x):
         pool1 = self.en_block1(x)
@@ -222,39 +270,6 @@ class UNet_n2n_un(nn.Module):
 
         return out
 
-class ResBlock(nn.Module):
-    def __init__(self, nf, ksize, norm=nn.BatchNorm2d, act=nn.LeakyReLU):
-        super().__init__()
-        
-        self.body = nn.Sequential(
-            nn.Conv2d(nf, nf, ksize, 1, ksize//2),
-            norm(nf),
-            act(0.1),
-            nn.Conv2d(nf, nf, ksize, 1, ksize//2),
-            norm(nf),
-            act(0.1)
-        )
-
-        self.shortcut = nn.Sequential(
-            nn.Conv2d(nf, nf, 1),
-            norm(nf)
-        )
-    
-    def forward(self, x):
-        return F.leaky_relu(x + self.body(x) + self.shortcut(x), 0.1)
-
-class MultiScaleLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.l1_loss = nn.L1Loss()
-        self.ssim_loss = SSIMLoss()
-    
-    def forward(self, pred, target):
-
-        l1 = self.l1_loss(pred, target)
-        ssim = self.ssim_loss(pred, target)
-        return l1 + 0.5 * (1 - ssim)
-
 class SSIMLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -274,21 +289,12 @@ class SSIMLoss(nn.Module):
                ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
         
         return 1 - ssim.mean()
+    
 
 class PerceptualLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, lambda_ssim=0.5):
         super().__init__()
+        self.lambda_ssim = lambda_ssim
         self.ssim_loss = SSIMLoss()
-    
     def forward(self, pred, target):
-
-        if pred.dim() == 3:
-            pred = pred.unsqueeze(0)
-        if target.dim() == 3:
-            target = target.unsqueeze(0)
-
-        ssim_val = self.ssim_loss(pred, target)
-
-        l1_loss = F.l1_loss(pred, target)
-        
-        return l1_loss + 0.5 * ssim_val  
+        return F.l1_loss(pred, target) + self.lambda_ssim * self.ssim_loss(pred, target)
