@@ -4,8 +4,7 @@ import torch.nn.functional as F
 class FrequencyBranch(nn.Module):
     def __init__(self, in_channels=1):
         super(FrequencyBranch, self).__init__()
-        
-        # 首先增加通道数
+
         self.channel_expand = nn.Conv2d(in_channels, 32, kernel_size=1)
         
         self.freq_conv = nn.Sequential(
@@ -18,10 +17,9 @@ class FrequencyBranch(nn.Module):
         )
     
     def forward(self, x):
-        # 先扩展通道
+
         x_expanded = self.channel_expand(x)
-        
-        # 经过频率分支处理
+
         freq_result = self.freq_conv(x_expanded) + x
         
         return freq_result
@@ -31,8 +29,7 @@ class MultiScaleSpatialBranch(nn.Module):
         super(MultiScaleSpatialBranch, self).__init__()
         
         self.scales = scales
-        
-        # 多尺度特征提取模块 - 修改通道数和下采样策略
+
         self.scale_modules = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
@@ -44,8 +41,7 @@ class MultiScaleSpatialBranch(nn.Module):
                 nn.LeakyReLU(0.1)
             ) for i in range(scales)
         ])
-        
-        # 掩码生成模块 - 确保输出一致
+
         self.mask_generators = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(32 * (2**i), 1, kernel_size=3, stride=1, padding=1),
@@ -53,35 +49,30 @@ class MultiScaleSpatialBranch(nn.Module):
             ) for i in range(scales)
         ])
         
-        # 特征融合模块 - 动态计算输入通道数
         total_channels = sum(32 * (2**i) for i in range(scales))
         self.feature_fusion = nn.Sequential(
             nn.Conv2d(total_channels, in_channels, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1)
-        )
-        
-        # 主干网络
+        )  
+
         self.trunk_network = UNet_n2n_un(in_channels, in_channels)
     
     def forward(self, x, mask_ratio=0.5):
-        # 多尺度特征提取
+
         multi_scale_features = []
         multi_scale_masks = []
         
         current_input = x
         for scale_module, mask_generator in zip(self.scale_modules, self.mask_generators):
-            # 特征提取
+
             feature = scale_module(current_input)
             multi_scale_features.append(feature)
-            
-            # 生成掩码
+
             mask = mask_generator(feature)
             multi_scale_masks.append(mask)
             
-            # 下采样输入准备下一尺度
             current_input = F.interpolate(current_input, scale_factor=0.5, mode='bilinear', align_corners=False)
-        
-        # 特征对齐：调整到最大特征图的大小
+
         max_size = multi_scale_features[0].shape[-2:]
         aligned_features = []
         aligned_masks = []
@@ -91,18 +82,14 @@ class MultiScaleSpatialBranch(nn.Module):
             aligned_masks.append(aligned_mask)
             aligned_features.append(aligned_feature)
         
-        # 特征融合
         fused_feature = torch.cat(aligned_features, dim=1)
         fused_feature = self.feature_fusion(fused_feature)
-        
-        # 生成综合掩码 - 确保大小与输入x一致
+
         combined_mask = torch.mean(torch.stack(aligned_masks), dim=0)
         
-        # 确保掩码的大小与输入x完全一致
         if combined_mask.shape != x.shape:
             combined_mask = F.interpolate(combined_mask, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        
-        # 应用掩码和主干网络去噪
+
         masked_input = x * combined_mask
         denoised_output = self.trunk_network(masked_input)
         
@@ -247,8 +234,7 @@ class ResBlock(nn.Module):
             norm(nf),
             act(0.1)
         )
-        
-        # 增加额外的残差连接
+
         self.shortcut = nn.Sequential(
             nn.Conv2d(nf, nf, 1),
             norm(nf)
@@ -264,7 +250,7 @@ class MultiScaleLoss(nn.Module):
         self.ssim_loss = SSIMLoss()
     
     def forward(self, pred, target):
-        # 多尺度损失
+
         l1 = self.l1_loss(pred, target)
         ssim = self.ssim_loss(pred, target)
         return l1 + 0.5 * (1 - ssim)
@@ -288,24 +274,21 @@ class SSIMLoss(nn.Module):
                ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
         
         return 1 - ssim.mean()
-    
-# 自定义感知损失
+
 class PerceptualLoss(nn.Module):
     def __init__(self):
         super().__init__()
         self.ssim_loss = SSIMLoss()
     
     def forward(self, pred, target):
-        # 确保通道匹配
+
         if pred.dim() == 3:
             pred = pred.unsqueeze(0)
         if target.dim() == 3:
             target = target.unsqueeze(0)
-        
-        # 计算SSIM损失
+
         ssim_val = self.ssim_loss(pred, target)
-        
-        # L1损失
+
         l1_loss = F.l1_loss(pred, target)
         
         return l1_loss + 0.5 * ssim_val  
