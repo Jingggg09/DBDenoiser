@@ -1,152 +1,187 @@
 import torch
-from PIL import Image
 import numpy as np
-from torch import nn
 import scipy.io as sio
-from skimage.metrics import peak_signal_noise_ratio
-from skimage.metrics import structural_similarity as ssim
-import yaml
-import random
+from torch.utils.data import Dataset, DataLoader, random_split
 from model import DualBranchDenoiser, PerceptualLoss
-from utils import reproduce, calculate_sliding_std, shuffle_input, get_shuffling_mask, generate_random_permutation, dwt_torch, idwt_torch, noise_suppress_freq_domain
+from utils import reproduce, calculate_sliding_std, shuffle_input, get_shuffling_mask, generate_random_permutation
 import os
 import cv2
 import pandas as pd
+import yaml
+import random
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity as ssim
 
 if not os.path.exists('output-sidd'):
-    os.makedirs('output-sidd')    
-
-results_sidd = []
-
-mat = sio.loadmat('data/ValidationNoisyBlocksSrgb.mat')
-noisy_block = mat['ValidationNoisyBlocksSrgb']
-mat = sio.loadmat('data/ValidationGtBlocksSrgb.mat')
-gt_block = mat['ValidationGtBlocksSrgb']
+    os.makedirs('output-sidd')
+if not os.path.exists('checkpoints'):
+    os.makedirs('checkpoints')
 
 
-def save_model(model, path, iteration, loss):
+mat_noisy = sio.loadmat('data/ValidationNoisyBlocksSrgb.mat')
+mat_gt    = sio.loadmat('data/ValidationGtBlocksSrgb.mat')
+
+noisy_5d = mat_noisy['ValidationNoisyBlocksSrgb'].astype(np.float32)   
+gt_5d    = mat_gt['ValidationGtBlocksSrgb'].astype(np.float32)
+
+
+noisy_blocks = noisy_5d.reshape(-1, *noisy_5d.shape[2:])   # [1280, 256, 256, 3]
+gt_blocks    = gt_5d.reshape(-1, *gt_5d.shape[2:])
+
+total_blocks = noisy_blocks.shape[0]  # 1280
+print(f"Loaded and flattened: {total_blocks} blocks, shape={noisy_blocks.shape}")
+
+
+class SIDDValDataset(Dataset):
+    def __init__(self, noisy_blocks, gt_blocks, indices):
+        self.noisy_blocks = noisy_blocks[indices]
+        self.gt_blocks    = gt_blocks[indices]
+        self.indices      = indices
+        
+        print(f"Dataset init: noisy_blocks shape = {self.noisy_blocks.shape}")  
+        print(f"First block shape: {self.noisy_blocks[0].shape if len(self.noisy_blocks)>0 else 'empty'}")
+    def __len__(self):
+        return len(self.indices) 
+    def __getitem__(self, idx):
+        noisy_np = self.noisy_blocks[idx] / 255.0
+        gt_np    = self.gt_blocks[idx] / 255.0
+        
+        assert noisy_np.shape == (256, 256, 3), f"Unexpected noisy shape: {noisy_np.shape}"
+        assert gt_np.shape    == (256, 256, 3), f"Unexpected gt shape: {gt_np.shape}"
+        
+        noisy = torch.from_numpy(noisy_np.transpose(2, 0, 1)).float()
+        gt    = torch.from_numpy(gt_np.transpose(2, 0, 1)).float()
+        
+        return noisy, gt, self.indices[idx]
+
+
+# reproduce(42)  # 
+indices = list(range(total_blocks))
+random.shuffle(indices)
+
+train_size = 1000    
+train_indices = indices[:train_size]
+val_indices   = indices[train_size:]
+
+train_dataset = SIDDValDataset(noisy_blocks, gt_blocks, train_indices)
+val_dataset   = SIDDValDataset(noisy_blocks, gt_blocks, val_indices)
+
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
+val_loader   = DataLoader(val_dataset,   batch_size=8, shuffle=False,  num_workers=4)
+
  
-    checkpoint = {
-        'iteration': iteration,
-        'model_state_dict': model.state_dict(),
-        'loss': loss
-    }
-    torch.save(checkpoint, path)
+def train_model(model, train_loader, val_loader, config):
+    model.train()
+    criterion = PerceptualLoss(lambda_ssim=config['lambda_ssim']).cuda()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], betas=(0.9, 0.999))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['num_iterations'], eta_min=1e-6)
 
-def train_model(model, noisy_original_torch, clean_original_torch, config):
+    best_val_loss = float('inf')
+    patience_counter = 0
+    global_step = 0
 
-    criterion = PerceptualLoss().cuda()
-    optimizer = torch.optim.Adam(model.parameters(), 
-                                lr=config['lr'], 
-                                weight_decay=1e-4, 
-                                betas=(0.9, 0.999))
-    
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
-        T_max=config['num_iterations'], 
-        eta_min=1e-6
-    )
-    
-    best_loss = float('inf')
-    patience = 50
-    trigger_times = 0
+    while global_step < config['num_iterations'] * 5:   
+        for noisy, gt, _ in train_loader:
+            noisy = noisy.cuda()  # [B,C,H,W]
+            gt    = gt.cuda()
 
-    os.makedirs(config.get('model_save_dir', 'checkpoints'), exist_ok=True)
-    
-    for iter in range(config['num_iterations']):
-        # Wavelet Transform
-        LL, LH, HL, HH = dwt_torch(noisy_original_torch)
-        
-        # Noise suppression in frequency domain
-        LL_denoised, LH_denoised, HL_denoised, HH_denoised = noise_suppress_freq_domain(
-            (LL, LH, HL, HH)
-        )
-        
-        # Reconstruct image
-        freq_denoised = idwt_torch(LL_denoised, LH_denoised, HL_denoised, HH_denoised)
-        
-        # Model forward pass
-        output, multi_scale_masks = model(noisy_original_torch)
-        
-        loss = criterion(output, clean_original_torch)
-        
-        for mask in multi_scale_masks:
-            mask_loss = torch.mean(torch.abs(mask - 0.5))
-            loss += 0.1 * mask_loss
-        
-        # 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            trigger_times = 0
-            
-            model_save_path = os.path.join(
-                config.get('model_save_dir', 'checkpoints'), 
-                f'best_model_block_{index_n}_{index_k}.pth'
+           
+            std_map = calculate_sliding_std(noisy, kernel_size=config['std_kernel_size'])
+            binary_mask = get_shuffling_mask(std_map, threshold=config['masking_threshold'])
+            shuffle_indices = generate_random_permutation(
+                noisy.shape[0], noisy.shape[2], noisy.shape[3],
+                config['shuffling_tile_size'], noisy.device
             )
-            save_model(model, model_save_path, iter, loss.item())
-            print(f"Saved best model at iteration {iter} with loss {loss.item()}")
-        else:
-            trigger_times += 1
-            if trigger_times >= patience:
-                print(f"Early stopping at iteration {iter}")
+            pseudo_target = shuffle_input(noisy, shuffle_indices, binary_mask, k=config['shuffling_tile_size'])
+
+            output, _ = model(noisy)
+            loss = criterion(output, pseudo_target)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
+            optimizer.step()
+            scheduler.step()
+
+            global_step += 1
+
+            
+            if global_step % 200 == 0:
+                model.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for v_noisy, v_gt, _ in val_loader:
+                        v_noisy = v_noisy.cuda()
+                        v_gt    = v_gt.cuda()
+                        v_output, _ = model(v_noisy)
+                        val_loss += criterion(v_output, v_gt).item()   
+                val_loss /= len(val_loader)
+                print(f"Step {global_step} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss:.4f}")
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    torch.save(model.state_dict(), 'checkpoints/best_model_all_val.pth')
+                else:
+                    patience_counter += 1
+                    if patience_counter >= config['early_stopping_patience']:
+                        print("Early stopping triggered")
+                        return model
+
+                model.train()
+
+            if global_step >= config['num_iterations'] * 5:
                 break
-    
+
     return model
 
+ 
+def main():
+    with open('configs/sidd.yaml', 'r') as f:
+        config = yaml.safe_load(f)
 
+    reproduce(config['seed'])
 
-for index_n in range(noisy_block.shape[0]):
-    for index_k in range(noisy_block.shape[1]):
-        with open('configs/sidd.yaml', 'r') as f:
-            config = yaml.safe_load(f)
+    model = DualBranchDenoiser(in_channels=config['input_channels']).cuda()
+    print(f"Training on {len(train_indices)} blocks, validating on {len(val_indices)} blocks")
 
-        model = DualBranchDenoiser(in_channels=3).cuda()
-        model.train()       
+    model = train_model(model, train_loader, val_loader, config)
 
-        noisy_orig_np = np.float32(noisy_block[index_n, index_k])
-        clean_orig_np = np.float32(gt_block[index_n, index_k])
+    
+    model.load_state_dict(torch.load('checkpoints/best_model_all_val.pth'))
+    model.eval()
 
-        noisy_original_torch = torch.from_numpy(np.transpose(noisy_orig_np, (2, 0, 1)) / 255.).unsqueeze(0).cuda()
-        clean_original_torch = torch.from_numpy(np.transpose(clean_orig_np, (2, 0, 1)) / 255.).unsqueeze(0).cuda()
+    results = []
+    with torch.no_grad():
+        for batch_idx, (noisy, gt, orig_idx) in enumerate(val_loader):
+            noisy = noisy.cuda()
+            accumulated = 0.0
+            
+            for _ in range(config['num_predictions']):  #  
+                out, _ = model(noisy)
+                accumulated += out.detach().cpu()
+            
+            avg_out = (accumulated / config['num_predictions'])  # [B, C, H, W]
+            
+            for i in range(avg_out.shape[0]):
+                single_denoised = avg_out[i].permute(1, 2, 0).numpy()
+                single_denoised = np.clip(single_denoised * 255., 0, 255).astype(np.uint8)
+                
+                single_gt = gt[i].permute(1, 2, 0).numpy() * 255.
+                single_gt = single_gt.astype(np.uint8)
+                
+                psnr_val = peak_signal_noise_ratio(single_gt, single_denoised, data_range=255)
+                ssim_val = ssim(single_gt, single_denoised, channel_axis=2, data_range=255)
+                
+                block_id = orig_idx[i].item()
+                results.append({'block_idx': block_id, 'psnr': psnr_val, 'ssim': ssim_val})
+                print(f"Block {block_id} - PSNR: {psnr_val:.2f}, SSIM: {ssim_val:.4f}")
+                
+                cv2.imwrite(f'output-sidd/denoised_val_{block_id}.png', cv2.cvtColor(single_denoised, cv2.COLOR_RGB2BGR))
 
-        model = train_model(model, noisy_original_torch, clean_original_torch, config)
+    df = pd.DataFrame(results)
+    df.to_csv('output-sidd/final_results_one_model.csv', index=False)
+    print(f"Mean PSNR on validation set: {df['psnr'].mean():.2f}")
+    print(f"Mean SSIM on validation set: {df['ssim'].mean():.4f}")
 
-        model.eval()
-        avg = 0.
-        with torch.no_grad():
-            for _ in range(config['num_predictions']):
-                output, _ = model(noisy_original_torch)
-                to_img = output.detach().cpu().squeeze().permute(1, 2, 0).numpy()
-                avg += to_img
-
-        # 
-        denoised_img = np.clip((avg/float(config['num_predictions']))*255., 0., 255.).astype(np.uint8)
-
-        # 
-        cv2.imwrite(f'output-sidd/denoised_{index_n}_{index_k}.png', cv2.cvtColor(denoised_img, cv2.COLOR_RGB2BGR))
-             
-        # 
-        psnr = peak_signal_noise_ratio(clean_orig_np, denoised_img, data_range=255)
-        ssim1 = ssim(clean_orig_np, denoised_img, channel_axis=2, data_range=255)
-        print(psnr, ssim1)      
-       
-        # 
-        results_sidd.append({
-            'block_n': index_n,
-            'block_k': index_k,
-            'psnr': psnr,
-            'ssim': ssim1
-        })
-
-# 
-results_df = pd.DataFrame(results_sidd)
-results_df.to_csv('output-sidd/results.csv', index=False)
-print(f"Average PSNR: {results_df['psnr'].mean():.2f}")
-print(f"Average SSIM: {results_df['ssim'].mean():.2f}")
+if __name__ == "__main__":
+    main()
