@@ -14,10 +14,8 @@ import cv2
 import pandas as pd
 import torch.nn.functional as F
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"   
 
-# 设置随机种子
-reproduce(42)
+# reproduce(42)
 
 if not os.path.exists('output-fmdd'):
     os.makedirs('output-fmdd')
@@ -26,15 +24,14 @@ results_fmdd = []
 
 paths = os.listdir('data/FMDD/raw/')
 for path in paths:
-    # 模型和优化器设置
+    # 
     torch.cuda.empty_cache()
     model = DualBranchDenoiser(1).cuda()
     model.train()      
     
     with open('configs/fmdd.yaml', 'r') as f:
         config = yaml.safe_load(f)
-
-    # 加载图像   
+   
     noisy_orig_np = np.float32(Image.open('data/FMDD/raw/' + path))
     clean_orig_np = np.float32(Image.open('data/FMDD/gt/' + path))
 
@@ -43,14 +40,12 @@ for path in paths:
 
 
     def train_model(model, noisy_original_torch, clean_orig_torch, config):
-        # 改进的损失函数
         criterion = PerceptualLoss().cuda()
         optimizer = torch.optim.Adam(model.parameters(), 
                                     lr=config['lr'], 
                                     weight_decay=1e-4, 
                                     betas=(0.9, 0.999))
         
-        # 学习率调度器
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, 
             T_max=config['num_iterations'], 
@@ -76,15 +71,15 @@ for path in paths:
             # Model forward pass
             output, multi_scale_masks = model(noisy_original_torch)
             
-            # 损失计算
+            # 
             loss = criterion(output, clean_original_torch)
             
-            # Mask正则化
+            # 
             for mask in multi_scale_masks:
                 mask_loss = torch.mean(torch.abs(mask - 0.5))
                 loss += 0.1 * mask_loss
             
-            # 梯度裁剪
+            # 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.zero_grad()
@@ -106,7 +101,7 @@ for path in paths:
 
     model = train_model(model, noisy_original_torch, clean_original_torch, config)
 
-    # 推理阶段
+
     model.eval()
     avg = 0.
     with torch.no_grad():
@@ -115,12 +110,10 @@ for path in paths:
             to_img = output.detach().cpu().squeeze().numpy()
             avg += to_img
 
-    # 后处理
     denoised_img = np.clip((avg/float(config['num_predictions']))*255., 0., 255.).astype(np.uint8)
 
     cv2.imwrite(f'output-fmdd/denoised_{path}', denoised_img)
-        
-    # 评估指标
+
     psnr = peak_signal_noise_ratio(clean_orig_np, denoised_img, data_range=255)
     ssim1 = ssim(clean_orig_np, denoised_img, data_range=255, win_size=3, channel_axis=None)
     print(psnr, ssim1)   
@@ -131,7 +124,6 @@ for path in paths:
         'ssim': ssim1
     })
 
-# 结果保存
 results_df = pd.DataFrame(results_fmdd)
 results_df.to_csv('output-fmdd/results.csv', index=False)
 print(f"Average PSNR: {results_df['psnr'].mean():.2f}")
